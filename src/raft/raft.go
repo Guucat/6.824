@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	//	"bytes"
 	"math/rand"
 	"sort"
@@ -121,13 +123,14 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.log)
+
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -136,18 +139,21 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var voteFor int
+	var log []Entry
+
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&voteFor) != nil ||
+		d.Decode(&log) != nil {
+		//DPrintf("[readPersist] error\n")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.voteFor = voteFor
+		rf.log = log
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -184,6 +190,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.role = Follower
 		rf.voteFor = -1
+		rf.persist()
 	}
 
 	reply.Term = rf.currentTerm
@@ -195,6 +202,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	if (rf.voteFor == -1 || rf.voteFor == args.CandidateId) && rf.isAtLeastUptoDate(args) {
 		rf.voteFor = args.CandidateId
+		rf.persist()
 		reply.VoteGranted = true
 		rf.lastResetElectionTime = time.Now()
 		DPrintf("term: %d  role: %s  peer: %d log: %d ===> give one vote to peer %d", rf.currentTerm, rf.printRole(), rf.me, len(rf.log), args.CandidateId)
@@ -285,6 +293,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 		Term:    term,
 	})
+	rf.persist()
 	return index, term, isLeader
 }
 
@@ -335,6 +344,7 @@ func (rf *Raft) startElection() {
 	rf.role = Candidate
 	rf.currentTerm++
 	rf.voteFor = rf.me
+	rf.persist()
 	rf.gotVotes = 1
 	rf.lastResetElectionTime = time.Now()
 	DPrintf("term: %d  role: %s  peer: %d log: %d ===> start to election", rf.currentTerm, rf.printRole(), rf.me, len(rf.log))
@@ -376,6 +386,7 @@ func (rf *Raft) requestVoteFrom(peer, votedTerm int) {
 		rf.currentTerm = reply.Term
 		rf.role = Follower
 		rf.voteFor = -1
+		rf.persist()
 		return
 	}
 
@@ -390,6 +401,7 @@ func (rf *Raft) requestVoteFrom(peer, votedTerm int) {
 	if rf.gotVotes > len(rf.peers)/2 {
 		rf.role = Leader
 		rf.voteFor = -1
+		rf.persist()
 		DPrintf("term: %d  role: %s  peer: %d log: %d ===> Sufficient votes, been Leader", rf.currentTerm, rf.printRole(), rf.me, len(rf.log))
 		// Reinitialized after election
 		for i := range rf.peers {
@@ -470,6 +482,7 @@ func (rf *Raft) heartBeatTo(peer int, empty bool) {
 		rf.currentTerm = reply.Term
 		rf.role = Follower
 		rf.voteFor = -1
+		rf.persist()
 	}
 
 	// Leader rules
@@ -513,6 +526,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.role = Follower
 		rf.voteFor = -1
+		rf.persist()
 	}
 
 	// Receiver implemention
@@ -552,6 +566,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// Log index out of range ,simply append new entries not already in the log
 		if args.PrevLogIndex+1+i > len(rf.log)-1 {
 			rf.log = append(rf.log, args.Entries[i:]...)
+			rf.persist()
 			break
 		}
 
@@ -560,6 +575,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if rf.log[args.PrevLogIndex+1+i].Term != args.Entries[i].Term {
 			rf.log = rf.log[:args.PrevLogIndex+1+i]
 			rf.log = append(rf.log, args.Entries[i:]...)
+			rf.persist()
 			break
 		}
 	}
