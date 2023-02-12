@@ -314,13 +314,11 @@ func (rf *Raft) ticker() {
 		// Check if a leader election should be started.
 		sleepTime := time.Now()
 		ms := 50 + (rand.Int63() % 300) // pause for a random amount of time between 50 and 350 milliseconds.
-		//ms := rand.Intn(150) + 150
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
 		rf.mu.Lock()
 		switch rf.role {
-		case Leader: // Leader doesn't need to elctec, does nothing
-
+		case Leader: // Leader just does nothing
 		case Candidate, Follower: // For candidate election time out, for follower may it's time start an election
 			if rf.lastResetElectionTime.Before(sleepTime) {
 				go rf.startElection()
@@ -365,12 +363,14 @@ func (rf *Raft) requestVoteFrom(peer, votedTerm int) {
 		return
 	}
 
-	// Processing response
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	// Prevent initializtion duplication after being Leader
 	if rf.role != Candidate {
 		return
 	}
+
 	// Rules for all servers
 	if rf.currentTerm < reply.Term {
 		rf.currentTerm = reply.Term
@@ -404,8 +404,8 @@ func (rf *Raft) heartBeatTicker() {
 	heartTicker := time.Tick(time.Duration(50) * time.Millisecond)
 	appendTicker := time.Tick(time.Duration(100) * time.Millisecond)
 
-	// send heartbeat immediately once wins an election
-	// here the code written is just because ticker will not trigger immediately
+	// Send heartbeat immediately once wins an election
+	// Here the code written is just because ticker will not trigger immediately
 	rf.atomicRangeSend(true)
 
 	for !rf.killed() {
@@ -422,19 +422,14 @@ func (rf *Raft) heartBeatTicker() {
 	}
 }
 
-// TODO Optimization, reduce lock occupancy time
+// Optimization, reduce lock occupancy time
 func (rf *Raft) atomicRangeSend(empty bool) {
-	rf.mu.Lock()
+	// Peers and me variables never be changed after initialization, locking make no sense
 	for peer := range rf.peers {
-		if rf.role != Leader {
-			rf.mu.Unlock()
-			return
-		}
 		if peer != rf.me {
 			go rf.heartBeatTo(peer, empty)
 		}
 	}
-	rf.mu.Unlock()
 }
 
 // Periodic hearbeats(AppendEntries RPCs that carry no log entries) that leader sent
@@ -488,26 +483,20 @@ func (rf *Raft) heartBeatTo(peer int, empty bool) {
 			return
 		}
 
-		// quick rollback term by term
-
-		// 如果Leader的log起始索引超出Follower长度, 直接从Follower长度处开始同步
-		// 减少一次遍历查询
+		// Quick rollback term by term
+		// 如果Leader的log起始索引超出Follower长度, 直接从Follower长度处开始同步, 减少一次遍历查询
 		if reply.Term == -1 {
 			rf.nextIndex[peer] = reply.FollowerIndex
 			return
 		}
-
-		// 如果leader.log找到了Term为FollowerTerm的日志，
-		// 则下一次从leader.log中FollowerTerm的最后一个log的位置的下一个开始同步日志
+		// 如果leader.log找到了Term为FollowerTerm的日志，则下一次从leader.log中FollowerTerm的最后一个log的位置的下一个开始同步日志
 		for i := reply.FollowerIndex; i > 0; i-- {
 			if rf.log[i].Term == reply.FollowerTerm {
 				rf.nextIndex[peer] = i + 1
 				return
 			}
 		}
-
-		// 如果leader.log找不到Term为FollowerTerm的日志，
-		// 则下一次从follower.log中FollowerTerm的第一个log的位置开始同步日志。
+		// 如果leader.log找不到Term为FollowerTerm的日志，则下一次从follower.log中FollowerTerm的第一个log的位置开始同步日志。
 		rf.nextIndex[peer] = reply.FollowerIndex
 	}
 }
@@ -650,9 +639,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	// start ticker goroutine to start elections
-	go rf.ticker()
-	go rf.applyTicker()
+	go rf.ticker()      // Keep monitoring election
+	go rf.applyTicker() // Keep monitoring applying log
 
 	return rf
 }
@@ -660,35 +648,45 @@ func Make(peers []*labrpc.ClientEnd, me int,
 // Rules for all servers
 func (rf *Raft) applyTicker() {
 	for !rf.killed() {
-		time.Sleep(time.Duration(10) * time.Millisecond)
+		time.Sleep(time.Duration(100) * time.Millisecond)
 
 		rf.mu.Lock()
 		switch rf.role {
 		case Follower, Candidate:
-			for rf.lastApplied < rf.commitIndex {
-				rf.lastApplied++
-				rf.applyCh <- ApplyMsg{
-					CommandValid: true,
-					Command:      rf.log[rf.lastApplied].Command,
-					CommandIndex: rf.lastApplied,
-				}
-			}
 		case Leader:
 			rf.commitIndex = rf.getCommitIndex()
-			// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine
-			if rf.commitIndex > rf.lastApplied {
-				// TODO Optimization: Logs can be copied and applied asynchronously to reduce the lock occupation time
-				for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-					rf.applyCh <- ApplyMsg{
-						CommandValid: true,
-						Command:      rf.log[i].Command,
-						CommandIndex: i,
-					}
-				}
-				rf.lastApplied = rf.commitIndex
+		}
+
+		// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine
+		if rf.commitIndex <= rf.lastApplied {
+			rf.mu.Unlock()
+			continue
+		}
+
+		last := rf.lastApplied
+		comm := rf.commitIndex
+		logs := make([]Entry, comm-last)
+		rf.lastApplied = rf.commitIndex
+		copy(logs, rf.log[last+1:comm+1]) // Logs been copied and applied asynchronously to reduce the lock occupation time
+		rf.mu.Unlock()
+
+		for i := range logs {
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      logs[i].Command,
+				CommandIndex: last + i + 1,
 			}
 		}
-		rf.mu.Unlock()
+
+		//for rf.lastApplied < rf.commitIndex {
+		//	rf.lastApplied++
+		//	rf.applyCh <- ApplyMsg{
+		//		CommandValid: true,
+		//		Command:      rf.log[rf.lastApplied].Command,
+		//		CommandIndex: rf.lastApplied,
+		//	}
+		//}
+		//rf.mu.Unlock()
 	}
 }
 
