@@ -490,14 +490,17 @@ func (rf *Raft) heartBeatTo(peer int, empty bool) {
 			return
 		}
 		// 如果leader.log找到了Term为FollowerTerm的日志，则下一次从leader.log中FollowerTerm的最后一个log的位置的下一个开始同步日志
-		for i := reply.FollowerIndex; i > 0; i-- {
-			if rf.log[i].Term == reply.FollowerTerm {
+		if rf.log[reply.FollowerIndex].Term == reply.FollowerTerm {
+			rf.nextIndex[peer] = reply.FollowerIndex
+			return
+		}
+		// if not, decrease index term by term
+		for i := plIndex; i >= 0; i-- {
+			if rf.log[i].Term != plTerm {
 				rf.nextIndex[peer] = i + 1
 				return
 			}
 		}
-		// 如果leader.log找不到Term为FollowerTerm的日志，则下一次从follower.log中FollowerTerm的第一个log的位置开始同步日志。
-		rf.nextIndex[peer] = reply.FollowerIndex
 	}
 }
 
@@ -536,14 +539,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Find the first log that term mathces Leader's prevlogterm
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.FollowerTerm = rf.log[args.PrevLogIndex].Term
-		for t := args.PrevLogIndex; t > 0; t-- {
+		for t := args.PrevLogIndex; t >= 0; t-- {
 			if rf.log[t].Term != rf.log[args.PrevLogIndex].Term {
 				reply.FollowerIndex = t + 1
 				return
 			}
 		}
-		reply.FollowerIndex = 1
-		return
 	}
 
 	// Log synchronizatin
