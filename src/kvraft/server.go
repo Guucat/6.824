@@ -7,6 +7,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = false
@@ -18,11 +19,15 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ClientId int64
+	ReqId    int64
+	Kind     string // command type, Put/Append/Get
+	Key      string
+	Value    string
 }
 
 type KVServer struct {
@@ -35,15 +40,80 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	db              map[string]string // kvDB to store value
+	clientsMaxReqId map[int64]int64   // max reqId clients had receiced
+	agreeChan       map[int]chan Op   // command index to Op channel
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	command := Op{
+		Kind: "Get",
+		Key:  args.Key,
+	}
+	comIndex, _, isLeader := kv.rf.Start(command)
+	reply.Err = ErrWrongLeader
+	if !isLeader {
+		return
+	}
+
+	ch := kv.getAgreeChan(comIndex)
+	op := Op{}
+	select {
+	case op = <-ch:
+		close(ch)
+	case <-time.After(time.Duration(600) * time.Millisecond): // timeout, the client may not be leader
+		return
+	}
+
+	// old leader in net partition and new leader was elected, the log may be overwrited
+	if !isSameOp(command, op) {
+		return
+	}
+
+	kv.mu.Lock()
+	reply.Err = OK
+	if _, ok := kv.db[args.Key]; !ok {
+		reply.Err = ErrNoKey
+	}
+	reply.Value = kv.db[args.Key]
+	kv.mu.Unlock()
+}
+
+func isSameOp(x, y Op) bool {
+	return x.ReqId == y.ReqId && x.Kind == y.Kind && x.Key == y.Key && x.ClientId == y.ClientId && x.Value == y.Value
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	command := Op{
+		ClientId: args.CliendId,
+		ReqId:    args.ReqId,
+		Kind:     args.Op,
+		Key:      args.Key,
+		Value:    args.Value,
+	}
+	comIndex, _, isLeader := kv.rf.Start(command)
+
+	reply.Err = ErrWrongLeader
+	if !isLeader {
+		return
+	}
+
+	ch := kv.getAgreeChan(comIndex)
+	op := Op{}
+	select {
+	case op = <-ch:
+		close(ch)
+	case <-time.After(time.Duration(600) * time.Millisecond):
+		return
+	}
+
+	if !isSameOp(command, op) {
+		return
+	}
+
+	reply.Err = OK
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -91,7 +161,42 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
-
+	kv.db = make(map[string]string)
+	kv.clientsMaxReqId = make(map[int64]int64)
+	kv.agreeChan = make(map[int]chan Op)
+	go kv.waitAgree()
 	return kv
+}
+
+func (kv *KVServer) waitAgree() {
+	for !kv.killed() {
+		msg := <-kv.applyCh
+		op := msg.Command.(Op) // the consensual command
+
+		kv.mu.Lock()
+		maxReqId, ok := kv.clientsMaxReqId[op.ClientId]
+		if !ok || op.ReqId > maxReqId { // leader only handle fresh request
+			switch op.Kind {
+			case "Put":
+				kv.db[op.Key] = op.Value
+			case "Append":
+				kv.db[op.Key] += op.Value
+			}
+		}
+		kv.mu.Unlock()
+
+		kv.getAgreeChan(msg.CommandIndex) <- op
+	}
+}
+
+func (kv *KVServer) getAgreeChan(commandIndex int) chan Op {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	ch, ok := kv.agreeChan[commandIndex]
+	if !ok {
+		ch = make(chan Op, 1) // can't block the chan
+		kv.agreeChan[commandIndex] = ch
+	}
+	return ch
 }
