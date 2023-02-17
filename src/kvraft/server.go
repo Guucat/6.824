@@ -62,7 +62,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	select {
 	case op = <-ch:
 		close(ch)
-	case <-time.After(time.Duration(600) * time.Millisecond): // timeout, the client may not be leader
+	case <-time.After(time.Duration(300) * time.Millisecond): // timeout, the client may not be leader
 		return
 	}
 
@@ -73,15 +73,19 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	kv.mu.Lock()
 	reply.Err = OK
-	if _, ok := kv.db[args.Key]; !ok {
-		reply.Err = ErrNoKey
-	}
+	//if _, ok := kv.db[args.Key]; !ok {
+	//	reply.Err = ErrNoKey
+	//}
 	reply.Value = kv.db[args.Key]
 	kv.mu.Unlock()
 }
 
 func isSameOp(x, y Op) bool {
-	return x.ReqId == y.ReqId && x.Kind == y.Kind && x.Key == y.Key && x.ClientId == y.ClientId && x.Value == y.Value
+	return x.ClientId == y.ClientId &&
+		x.ReqId == y.ReqId &&
+		x.Kind == y.Kind &&
+		x.Key == y.Key &&
+		x.Value == y.Value
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -105,7 +109,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	select {
 	case op = <-ch:
 		close(ch)
-	case <-time.After(time.Duration(600) * time.Millisecond):
+	case <-time.After(time.Duration(300) * time.Millisecond):
 		return
 	}
 
@@ -114,6 +118,40 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	reply.Err = OK
+}
+
+func (kv *KVServer) waitAgree() {
+	for !kv.killed() {
+		msg := <-kv.applyCh
+		op := msg.Command.(Op) // the consensual command
+
+		kv.mu.Lock()
+		maxReqId, ok := kv.clientsMaxReqId[op.ClientId]
+		if !ok || op.ReqId > maxReqId { // leader only handle fresh request
+			switch op.Kind {
+			case "Put":
+				kv.db[op.Key] = op.Value
+			case "Append":
+				kv.db[op.Key] += op.Value
+			}
+			kv.clientsMaxReqId[op.ClientId] = maxReqId
+		}
+		kv.mu.Unlock()
+
+		kv.getAgreeChan(msg.CommandIndex) <- op
+	}
+}
+
+func (kv *KVServer) getAgreeChan(commandIndex int) chan Op {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	ch, ok := kv.agreeChan[commandIndex]
+	if !ok {
+		ch = make(chan Op, 1) // can't block the chan
+		kv.agreeChan[commandIndex] = ch
+	}
+	return ch
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -166,37 +204,4 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.agreeChan = make(map[int]chan Op)
 	go kv.waitAgree()
 	return kv
-}
-
-func (kv *KVServer) waitAgree() {
-	for !kv.killed() {
-		msg := <-kv.applyCh
-		op := msg.Command.(Op) // the consensual command
-
-		kv.mu.Lock()
-		maxReqId, ok := kv.clientsMaxReqId[op.ClientId]
-		if !ok || op.ReqId > maxReqId { // leader only handle fresh request
-			switch op.Kind {
-			case "Put":
-				kv.db[op.Key] = op.Value
-			case "Append":
-				kv.db[op.Key] += op.Value
-			}
-		}
-		kv.mu.Unlock()
-
-		kv.getAgreeChan(msg.CommandIndex) <- op
-	}
-}
-
-func (kv *KVServer) getAgreeChan(commandIndex int) chan Op {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	ch, ok := kv.agreeChan[commandIndex]
-	if !ok {
-		ch = make(chan Op, 1) // can't block the chan
-		kv.agreeChan[commandIndex] = ch
-	}
-	return ch
 }

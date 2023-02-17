@@ -54,16 +54,17 @@ func (ck *Clerk) Get(key string) string {
 			Key: key,
 		}
 		reply := GetReply{}
+
 		DPrintf("client %d get %s from leader %d", ck.clientId, key, ck.leaderId)
 		ok := ck.servers[ck.leaderId].Call("KVServer.Get", &args, &reply)
+
 		if !ok || reply.Err == ErrWrongLeader {
 			ck.changeLeader()
 			continue
 		}
-
-		if reply.Err == ErrNoKey {
-			return ""
-		}
+		//if reply.Err == ErrNoKey {
+		//	return ""
+		//}
 		return reply.Value
 	}
 }
@@ -91,11 +92,11 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 		DPrintf("client %d %s %s val: %s from leader %d", ck.clientId, op, key, value, ck.leaderId)
 		ok := ck.servers[ck.leaderId].Call("KVServer.PutAppend", &args, &reply)
+
 		if !ok || reply.Err == ErrWrongLeader {
 			ck.changeLeader()
 			continue
 		}
-
 		return
 	}
 }

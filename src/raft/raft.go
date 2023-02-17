@@ -83,6 +83,10 @@ type Raft struct {
 	lastResetElectionTime time.Time // wait a period of time to receive tpc call, refresh once is called
 	applyCh               chan ApplyMsg
 	gotVotes              int // The count of votes received in an election
+
+	// speed up
+	synchroChan chan struct{}
+	commitChan  chan struct{}
 }
 
 type Entry struct {
@@ -281,7 +285,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.role != Leader {
+	if rf.role != Leader || rf.killed() { //even if the Raft instance has been killed, this function should return gracefully.
 		isLeader = false
 		return index, term, isLeader
 	}
@@ -293,7 +297,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 		Term:    term,
 	})
+
 	rf.persist()
+	rf.atomicRangeSend(false)
+
 	return index, term, isLeader
 }
 
@@ -413,8 +420,8 @@ func (rf *Raft) requestVoteFrom(peer, votedTerm int) {
 }
 
 func (rf *Raft) heartBeatTicker() {
-	heartTicker := time.Tick(time.Duration(50) * time.Millisecond)
-	appendTicker := time.Tick(time.Duration(100) * time.Millisecond)
+	//heartTicker := time.Tick(time.Duration(50) * time.Millisecond)
+	appendTicker := time.Tick(time.Duration(50) * time.Millisecond)
 
 	// Send heartbeat immediately once wins an election
 	// Here the code written is just because ticker will not trigger immediately
@@ -426,8 +433,8 @@ func (rf *Raft) heartBeatTicker() {
 		}
 
 		select {
-		case <-heartTicker:
-			go rf.atomicRangeSend(true)
+		//case <-heartTicker:
+		//go rf.atomicRangeSend(true)
 		case <-appendTicker:
 			go rf.atomicRangeSend(false)
 		}
@@ -447,11 +454,18 @@ func (rf *Raft) atomicRangeSend(empty bool) {
 // Periodic hearbeats(AppendEntries RPCs that carry no log entries) that leader sent
 func (rf *Raft) heartBeatTo(peer int, empty bool) {
 	rf.mu.Lock()
+	if rf.role != Leader {
+		rf.mu.Unlock()
+		return
+	}
 	DPrintf("term: %d  role: %s  peer: %d log: %d ===> send heartbear to %d", rf.currentTerm, rf.printRole(), rf.me, len(rf.log), peer)
 	var entries []Entry
 	var plIndex, plTerm int
 	if !empty {
 		plIndex = rf.nextIndex[peer] - 1
+		//if plIndex < 0 {
+		//	plIndex = 1
+		//}
 		plTerm = rf.log[plIndex].Term
 		entries = make([]Entry, len(rf.log[plIndex+1:]))
 		copy(entries, rf.log[plIndex+1:])
@@ -476,6 +490,9 @@ func (rf *Raft) heartBeatTo(peer int, empty bool) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if rf.role != Leader {
+		return
+	}
 
 	// Rules for all servers
 	if rf.currentTerm < reply.Term {
@@ -483,6 +500,7 @@ func (rf *Raft) heartBeatTo(peer int, empty bool) {
 		rf.role = Follower
 		rf.voteFor = -1
 		rf.persist()
+		return
 	}
 
 	// Leader rules
@@ -490,6 +508,7 @@ func (rf *Raft) heartBeatTo(peer int, empty bool) {
 		// Be careful, rf.log length is keeping change, therefore use entries variable to cumpute
 		rf.matchIndex[peer] = plIndex + len(entries)
 		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+		rf.applyTicker()
 	} else {
 		// Filter heartBeat RPC
 		if empty {
@@ -503,17 +522,25 @@ func (rf *Raft) heartBeatTo(peer int, empty bool) {
 			return
 		}
 		// 如果leader.log找到了Term为FollowerTerm的日志，则下一次从leader.log中FollowerTerm的最后一个log的位置的下一个开始同步日志
-		if rf.log[reply.FollowerIndex].Term == reply.FollowerTerm {
-			rf.nextIndex[peer] = reply.FollowerIndex
-			return
-		}
-		// if not, decrease index term by term
-		for i := plIndex; i >= 0; i-- {
-			if rf.log[i].Term != plTerm {
+		//if rf.log[reply.FollowerIndex].Term == reply.FollowerTerm {
+		//	DPrintf("roll back FollowerIndex %d empty %v", reply.FollowerIndex, empty)
+		//	rf.nextIndex[peer] = reply.FollowerIndex
+		//	return
+		//}
+		for i := len(rf.log) - 1; i > 0; i-- {
+			if rf.log[i].Term == reply.FollowerTerm {
 				rf.nextIndex[peer] = i + 1
 				return
 			}
 		}
+		// if not, decrease index term by term
+		//for i := plIndex; i >= 0; i-- {
+		//	if rf.log[i].Term != plTerm {
+		//		rf.nextIndex[peer] = i + 1
+		//		return
+		//	}
+		//}
+		rf.nextIndex[peer] = reply.FollowerIndex
 	}
 }
 
@@ -542,6 +569,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintf("term: %d  role: %s  peer: %d log: %d ===> receiv hearBeat rpc from %d", rf.currentTerm, rf.printRole(), rf.me, len(rf.log), args.LeaderId)
 		return
 	}
+	rf.lastResetElectionTime = time.Now()
 
 	// Quick rollback
 	// Out of length, just return the last log index
@@ -559,6 +587,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				return
 			}
 		}
+		return
 	}
 
 	// Log synchronizatin
@@ -587,6 +616,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Successly appended logs, reply true
 	reply.Success = true
+	rf.applyTicker()
 	DPrintf("term: %d  role: %s  peer: %d log: %d ===> successly appended logs", rf.currentTerm, rf.printRole(), rf.me, len(rf.log))
 }
 
@@ -652,59 +682,62 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.role = Follower
 	rf.applyCh = applyCh
 	rf.lastResetElectionTime = time.Now()
+	rf.synchroChan = make(chan struct{})
+	rf.commitChan = make(chan struct{})
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	go rf.ticker()      // Keep monitoring election
-	go rf.applyTicker() // Keep monitoring applying log
+	go rf.ticker() // Keep monitoring election
+	//go rf.applyTicker() // Keep monitoring applying log
 
 	return rf
 }
 
 // Rules for all servers
 func (rf *Raft) applyTicker() {
-	for !rf.killed() {
-		time.Sleep(time.Duration(100) * time.Millisecond)
+	//for !rf.killed() {
+	//time.Sleep(time.Duration(10) * time.Millisecond)
 
-		rf.mu.Lock()
-		switch rf.role {
-		case Follower, Candidate:
-		case Leader:
-			rf.commitIndex = rf.getCommitIndex()
-		}
-
-		// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine
-		if rf.commitIndex <= rf.lastApplied {
-			rf.mu.Unlock()
-			continue
-		}
-
-		last := rf.lastApplied
-		comm := rf.commitIndex
-		logs := make([]Entry, comm-last)
-		rf.lastApplied = rf.commitIndex
-		copy(logs, rf.log[last+1:comm+1]) // Logs been copied and applied asynchronously to reduce the lock occupation time
-		rf.mu.Unlock()
-
-		for i := range logs {
-			rf.applyCh <- ApplyMsg{
-				CommandValid: true,
-				Command:      logs[i].Command,
-				CommandIndex: last + i + 1,
-			}
-		}
-
-		//for rf.lastApplied < rf.commitIndex {
-		//	rf.lastApplied++
-		//	rf.applyCh <- ApplyMsg{
-		//		CommandValid: true,
-		//		Command:      rf.log[rf.lastApplied].Command,
-		//		CommandIndex: rf.lastApplied,
-		//	}
-		//}
-		//rf.mu.Unlock()
+	//rf.mu.Lock()
+	switch rf.role {
+	case Follower, Candidate:
+	case Leader:
+		rf.commitIndex = rf.getCommitIndex()
 	}
+
+	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine
+	if rf.commitIndex <= rf.lastApplied {
+		//rf.mu.Unlock()
+		//continue
+		return
+	}
+
+	last := rf.lastApplied
+	comm := rf.commitIndex
+	logs := make([]Entry, comm-last)
+	rf.lastApplied = rf.commitIndex
+	copy(logs, rf.log[last+1:comm+1]) // Logs been copied and applied asynchronously to reduce the lock occupation time
+	//rf.mu.Unlock()
+
+	for i := range logs {
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      logs[i].Command,
+			CommandIndex: last + i + 1,
+		}
+	}
+
+	//for rf.lastApplied < rf.commitIndex {
+	//	rf.lastApplied++
+	//	rf.applyCh <- ApplyMsg{
+	//		CommandValid: true,
+	//		Command:      rf.log[rf.lastApplied].Command,
+	//		CommandIndex: rf.lastApplied,
+	//	}
+	//}
+	//rf.mu.Unlock()
+	//}
 }
 
 func (rf *Raft) getCommitIndex() int {
