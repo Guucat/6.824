@@ -283,10 +283,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	if rf.role != Leader || rf.killed() { //even if the Raft instance has been killed, this function should return gracefully.
 		isLeader = false
+		rf.mu.Unlock()
 		return index, term, isLeader
 	}
 
@@ -297,10 +296,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 		Term:    term,
 	})
-
 	rf.persist()
-	rf.atomicRangeSend(false)
+	rf.mu.Unlock()
 
+	rf.atomicRangeSend(false) // sychro log once start log
 	return index, term, isLeader
 }
 
@@ -366,6 +365,11 @@ func (rf *Raft) startElection() {
 func (rf *Raft) requestVoteFrom(peer, votedTerm int) {
 	// Init RequestVoteArgs
 	rf.mu.Lock()
+	if rf.role != Candidate {
+		rf.mu.Unlock()
+		return
+	}
+
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
@@ -383,11 +387,6 @@ func (rf *Raft) requestVoteFrom(peer, votedTerm int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// Prevent initializtion duplication after being Leader
-	if rf.role != Candidate {
-		return
-	}
-
 	// Rules for all servers
 	if rf.currentTerm < reply.Term {
 		rf.currentTerm = reply.Term
@@ -398,7 +397,7 @@ func (rf *Raft) requestVoteFrom(peer, votedTerm int) {
 	}
 
 	// Simply ignore expired replies
-	if reply.Term != rf.currentTerm || votedTerm != rf.currentTerm {
+	if rf.role != Candidate || reply.Term != rf.currentTerm || votedTerm != rf.currentTerm {
 		return
 	}
 
@@ -422,10 +421,9 @@ func (rf *Raft) requestVoteFrom(peer, votedTerm int) {
 func (rf *Raft) heartBeatTicker() {
 	//heartTicker := time.Tick(time.Duration(50) * time.Millisecond)
 	appendTicker := time.Tick(time.Duration(50) * time.Millisecond)
-
 	// Send heartbeat immediately once wins an election
 	// Here the code written is just because ticker will not trigger immediately
-	rf.atomicRangeSend(true)
+	rf.atomicRangeSend(false)
 
 	for !rf.killed() {
 		if _, isLeader := rf.GetState(); !isLeader {
@@ -444,20 +442,23 @@ func (rf *Raft) heartBeatTicker() {
 // Optimization, reduce lock occupancy time
 func (rf *Raft) atomicRangeSend(empty bool) {
 	// Peers and me variables never be changed after initialization, locking make no sense
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	for peer := range rf.peers {
 		if peer != rf.me {
-			go rf.heartBeatTo(peer, empty)
+			go rf.heartBeatTo(peer, empty, rf.currentTerm)
 		}
 	}
 }
 
 // Periodic hearbeats(AppendEntries RPCs that carry no log entries) that leader sent
-func (rf *Raft) heartBeatTo(peer int, empty bool) {
+func (rf *Raft) heartBeatTo(peer int, empty bool, heartedTerm int) {
 	rf.mu.Lock()
 	if rf.role != Leader {
 		rf.mu.Unlock()
 		return
 	}
+
 	DPrintf("term: %d  role: %s  peer: %d log: %d ===> send heartbear to %d", rf.currentTerm, rf.printRole(), rf.me, len(rf.log), peer)
 	var entries []Entry
 	var plIndex, plTerm int
@@ -490,9 +491,6 @@ func (rf *Raft) heartBeatTo(peer int, empty bool) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.role != Leader {
-		return
-	}
 
 	// Rules for all servers
 	if rf.currentTerm < reply.Term {
@@ -503,12 +501,17 @@ func (rf *Raft) heartBeatTo(peer int, empty bool) {
 		return
 	}
 
+	// Simply ignore expired replies
+	if rf.role != Leader || reply.Term != rf.currentTerm || heartedTerm != rf.currentTerm {
+		return
+	}
+
 	// Leader rules
 	if reply.Success {
 		// Be careful, rf.log length is keeping change, therefore use entries variable to cumpute
 		rf.matchIndex[peer] = plIndex + len(entries)
 		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
-		rf.applyTicker()
+		rf.applyLogs() // apply log once success to asynchro log
 	} else {
 		// Filter heartBeat RPC
 		if empty {
@@ -527,7 +530,7 @@ func (rf *Raft) heartBeatTo(peer int, empty bool) {
 		//	rf.nextIndex[peer] = reply.FollowerIndex
 		//	return
 		//}
-		for i := len(rf.log) - 1; i > 0; i-- {
+		for i := len(rf.log) - 1; i >= 0; i-- {
 			if rf.log[i].Term == reply.FollowerTerm {
 				rf.nextIndex[peer] = i + 1
 				return
@@ -616,7 +619,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Successly appended logs, reply true
 	reply.Success = true
-	rf.applyTicker()
+	rf.applyLogs()
 	DPrintf("term: %d  role: %s  peer: %d log: %d ===> successly appended logs", rf.currentTerm, rf.printRole(), rf.me, len(rf.log))
 }
 
@@ -687,7 +690,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+	for i := range rf.peers {
+		rf.nextIndex[i] = len(rf.log) // initialized to leader last log index + 1
+	}
 	go rf.ticker() // Keep monitoring election
 	//go rf.applyTicker() // Keep monitoring applying log
 
@@ -695,7 +700,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 // Rules for all servers
-func (rf *Raft) applyTicker() {
+func (rf *Raft) applyLogs() {
 	//for !rf.killed() {
 	//time.Sleep(time.Duration(10) * time.Millisecond)
 

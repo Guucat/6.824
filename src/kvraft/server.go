@@ -62,7 +62,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	select {
 	case op = <-ch:
 		close(ch)
-	case <-time.After(time.Duration(300) * time.Millisecond): // timeout, the client may not be leader
+	case <-time.After(time.Duration(500) * time.Millisecond): // timeout, the client may not be leader
+		reply.Err = ErrNoResponse
 		return
 	}
 
@@ -109,7 +110,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	select {
 	case op = <-ch:
 		close(ch)
-	case <-time.After(time.Duration(300) * time.Millisecond):
+	case <-time.After(time.Duration(500) * time.Millisecond):
+		reply.Err = ErrNoResponse
 		return
 	}
 
