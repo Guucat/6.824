@@ -62,9 +62,6 @@ func (ck *Clerk) Get(key string) string {
 			ck.changeLeader()
 			continue
 		}
-		if reply.Err == ErrNoResponse {
-			continue
-		}
 		//if reply.Err == ErrNoKey {
 		//	return ""
 		//}
@@ -98,9 +95,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 		if !ok || reply.Err == ErrWrongLeader {
 			ck.changeLeader()
-			continue
-		}
-		if reply.Err == ErrNoResponse {
 			continue
 		}
 		return

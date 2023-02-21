@@ -4,7 +4,7 @@ const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
-	ErrNoResponse  = "ErrNoResponse"
+	//ErrNoResponse  = "ErrNoResponse"
 )
 
 type Err string
