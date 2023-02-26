@@ -420,6 +420,7 @@ func (rf *Raft) requestVoteFrom(peer, votedTerm int) {
 }
 
 func (rf *Raft) heartBeatTicker() {
+	rf.Start("")
 	//heartTicker := time.Tick(time.Duration(50) * time.Millisecond)
 	appendTicker := time.Tick(time.Duration(50) * time.Millisecond)
 	// Send heartbeat immediately once wins an election

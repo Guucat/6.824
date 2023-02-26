@@ -58,6 +58,10 @@ Leader 处理 快重传时:
 通过率✅   95/100
 
 [一致性读优化](https://cn.pingcap.com/blog/linearizability-and-raft)
+
+[细节参考](https://github.com/OneSizeFitsQuorum/MIT6.824-2021/blob/master/docs/lab3.md)
+
 ⚠️每个请求日志请求都会有初始化一个channle来获取同步的结果，我们通过term 和 index去标识，如果单独使用logindex去标识，可能会导致这个标识不唯一。
+leader一上线就可以提交一条空日志，以迅速恢复状态机的状态，因为leader重启上线后第一条log是读请求，此时leader状态机是没有状态的。并且，此时的状态机就可以不用通过Readlog的方式去Get key
 
 

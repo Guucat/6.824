@@ -136,6 +136,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) waitAgree() {
 	for !kv.killed() {
 		msg := <-kv.applyCh
+		switch msg.Command.(type) {
+		case string:
+			continue
+		}
 		op := msg.Command.(Op) // the consensual command
 
 		kv.mu.Lock()
