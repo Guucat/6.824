@@ -4,10 +4,12 @@ import (
 	"6.5840/labrpc"
 	"crypto/rand"
 	"math/big"
+	"sync"
 	"sync/atomic"
 )
 
 type Clerk struct {
+	mu      sync.Mutex
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	leaderId int
@@ -32,7 +34,15 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	return ck
 }
 
+func (ck *Clerk) getLeader() int {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	return ck.leaderId
+}
+
 func (ck *Clerk) changeLeader() {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
 	ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 }
 
@@ -55,8 +65,8 @@ func (ck *Clerk) Get(key string) string {
 		}
 		reply := GetReply{}
 
-		DPrintf("client %d get %s from leader %d", ck.clientId, key, ck.leaderId)
-		ok := ck.servers[ck.leaderId].Call("KVServer.Get", &args, &reply)
+		DPrintf("client %d get %s from leader %d", ck.clientId, key, ck.getLeader())
+		ok := ck.servers[ck.getLeader()].Call("KVServer.Get", &args, &reply)
 
 		if !ok || reply.Err == ErrWrongLeader {
 			ck.changeLeader()
@@ -90,8 +100,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		}
 		reply := PutAppendReply{}
 
-		DPrintf("client %d %s %s val: %s from leader %d", ck.clientId, op, key, value, ck.leaderId)
-		ok := ck.servers[ck.leaderId].Call("KVServer.PutAppend", &args, &reply)
+		DPrintf("client %d %s %s val: %s from leader %d", ck.clientId, op, key, value, ck.getLeader())
+		ok := ck.servers[ck.getLeader()].Call("KVServer.PutAppend", &args, &reply)
 
 		if !ok || reply.Err == ErrWrongLeader {
 			ck.changeLeader()
