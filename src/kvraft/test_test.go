@@ -418,7 +418,8 @@ func GenericTestSpeed(t *testing.T, part string, maxraftstate int) {
 	if dur > numOps*timePerOp {
 		t.Fatalf("Operations completed too slowly %v/op > %v/op\n", dur/numOps, timePerOp)
 	}
-
+	fmt.Println("dur", dur)
+	fmt.Println(dur / numOps)
 	cfg.end()
 }
 
